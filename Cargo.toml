@@ -1,0 +1,29 @@
+[package]
+name = "user-db"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+user-lib = { path = "../user-lib"}
+token-lib = { path = "../token-lib"}
+crypto-lib = { path = "../crypto-lib"}
+sqlx = { version = "0.7.2", features = ["runtime-async-std", "postgres","uuid","time","chrono"] }
+async-std = "1.12.0"
+serde_with = { version = "2.0.0", features = ["time_0_3"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.94"
+simple_logger = "4.2.0"
+log = "0.4.20"
+sqlx-cli = "0.7.4"
+tokio = { version = "1.33", features = ["full"] }
+time = "0.3.11"
+
+uuid = { version = "1" }
+random-string = "1.0"
+
+# get all required types
+chrono = { version = "0.4.*", features = ["serde"] }
+dotenvy = "0.15.1"
+
