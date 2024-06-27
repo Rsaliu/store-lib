@@ -1,23 +1,32 @@
 use crate::stores::store::{StoreError, StoreTrait};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::{
+    postgres::PgArguments,
+    query::{self, QueryAs},
+    Execute, Pool, Postgres,
+};
 use simple_logger::SimpleLogger;
-use sqlx::{query, Execute, Pool, Postgres};
 use std::{error::Error, io};
 use user_lib::user::user::{User, UserRoles};
 use uuid::Uuid;
 use crypto_lib::crypto::{self, crypto::CryptoOp};
-
+use sqlx::query::Query;
+use sqlx::postgres::PgRow;
+use sqlx::Row;
+use sqlx::Column;
+use sqlx::TypeInfo;
+use std::str::FromStr;
 #[derive(Debug, Deserialize, sqlx::FromRow, Serialize, Clone)]
 pub struct UserRow {
-    id: Uuid,
-    username: String,
-    email: String,
-    password_hash: String,
-    user_role: UserRoles,
-    confirmed: bool,
-    created_at: NaiveDateTime,
-    updated_at: NaiveDateTime,
+    pub id: Uuid,
+    pub username: String,
+    pub email: String,
+    pub password_hash: String,
+    pub user_role: UserRoles,
+    pub confirmed: bool,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +62,69 @@ impl UserPGStore {
 }
 
 impl StoreTrait for UserPGStore {
+    fn bind_values<'a>(&self,
+        custom_query: Query<'a,Postgres, PgArguments>,
+        json_value: &'a serde_json::Value,
+    ) -> Result<Query<'a,Postgres, PgArguments>, StoreError> {
+        // Loop through the JSON object by key
+        let mut custom_query = custom_query;
+
+        if let serde_json::Value::Object(map) = json_value {
+            for (key, value) in map {
+                println!("Key: {}, Value: {}", key, value);
+                match key.as_str() {
+                    "id" => {
+                        let muid:Uuid = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("uuid obtained is: {:?}", muid);
+                        custom_query = custom_query.bind(muid);
+                    },
+                    "user_role" => {
+                        let role:UserRoles = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("role obtained is: {:?}", role);
+                        custom_query = custom_query.bind(role);
+                    },
+                    "created_at"|"updated_at" => {
+                        let time:NaiveDateTime = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("time obtained is: {:?}", time);
+                        custom_query = custom_query.bind(time);
+                    },
+                    "confirmed" => {
+                        let confirm:bool = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("confirm obtained is: {:?}", confirm);
+                        custom_query = custom_query.bind(confirm);
+                    },
+                    _ => {
+                        // Handle other keys here
+                        let text:String = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("text obtained is: {:?}", text);
+                        custom_query = custom_query.bind(text);
+                    }
+                }
+            }
+        }
+
+        Ok(custom_query)
+    }
+    fn row_to_json(&self,row: &PgRow) -> Result<serde_json::Value, sqlx::Error> {
+        let mut json_obj = serde_json::Map::new();
+        println!("trying to convert to json");
+        for column in row.columns() {
+            let column_name = column.name();
+            println!("column type is: {:?}",column.type_info().name());
+            let column_value: serde_json::Value = match column.type_info().name() {
+                // Handle different types as needed
+                "UUID" => serde_json::json!(row.try_get::<uuid::Uuid, _>(column_name)?),
+                "user_role" => serde_json::json!(row.try_get::<UserRoles, _>(column_name)?),
+                "BOOL" => serde_json::json!(row.try_get::<bool, _>(column_name)?),
+                "TIMESTAMP" => serde_json::json!(row.try_get::<NaiveDateTime, _>(column_name)?),
+                _ => serde_json::json!(row.get::<String, _>(column_name)), 
+            };
+    
+            json_obj.insert(column_name.to_owned(), column_value);
+        }
+    
+        Ok(serde_json::Value::Object(json_obj))
+    }
     async fn insert(
         &self,
         connection: &Pool<Postgres>,
@@ -212,5 +284,41 @@ impl StoreTrait for UserPGStore {
             .map(|row| serde_json::to_value(row.clone()).map_err(StoreError::JsonError))
             .collect::<Result<Vec<serde_json::Value>, StoreError>>()?;
         Ok(user_datas)
+    }
+    async fn patch(
+        &self,
+        connection: &Pool<Postgres>,
+        id: Uuid,
+        patch: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let mut custom_query: String = String::from(r#"update users set "#);
+        let mut values = Vec::new();
+        let mut conditions = Vec::new();
+        let mut max_variable = 0;
+        // Check if the parsed value is an object
+        if let serde_json::Value::Object(map) = patch.clone() {
+            // Iterate over the key-value pairs in the object
+
+            for (key, value) in map {
+                println!("Key: {}, Value: {}", key, value);
+                values.push(value.to_string().trim_matches('"').to_string());
+                conditions.push(format!("{} = ${}", key, conditions.len() + 1));
+                max_variable = conditions.len() + 1;
+            }
+        } else {
+            log::debug!("The JSON data is not an object");
+            return Err(StoreError::NotFound);
+        }
+        custom_query.push_str(&conditions.join(" , "));
+        custom_query.push_str(format!(" WHERE id = ${}", max_variable).as_str());
+        println!("final query is: {custom_query}");
+        let mut custom_query = sqlx::query(&custom_query);
+        custom_query = self.bind_values(custom_query, &patch)?;
+        custom_query = custom_query.bind(id);
+        println!("id to patch {}", id.to_string());
+        let affected_rows = custom_query.execute(connection).await.map_err(StoreError::SqlxError)?;
+
+        println!("Updated {} row(s)", affected_rows.rows_affected());
+        Ok(())
     }
 }

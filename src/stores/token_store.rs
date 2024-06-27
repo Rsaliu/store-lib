@@ -3,18 +3,29 @@ use std::str::FromStr;
 use crate::stores::store::{StoreError, StoreTrait};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{query, Execute, Pool, Postgres};
+use sqlx::{
+    postgres::PgArguments,
+    query::{self, QueryAs},
+    Execute, Pool, Postgres,
+};
+use token_lib::token::token::{Token, TokenType};
 use user_lib::user::user::{User, UserRoles};
 use uuid::Uuid;
-use token_lib::token::token::Token;
+use sqlx::query::Query;
+use sqlx::postgres::PgRow;
+use sqlx::Row;
+use sqlx::Column;
+use sqlx::TypeInfo;
 #[derive(Debug, Deserialize, sqlx::FromRow, Serialize, Clone)]
 pub struct TokenRow {
-    id: Uuid,
-    token_string: String,
-    user_id: Uuid,
-    expired_in: NaiveDateTime,
-    created_at: NaiveDateTime,
-    updated_at: NaiveDateTime,
+    pub id: Uuid,
+    pub token_string: String,
+    pub user_id: Uuid,
+    pub expired_in: NaiveDateTime,
+    pub token_type: TokenType,
+    pub blacklisted: bool,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 }
 
 impl Into<Token> for TokenRow {
@@ -23,7 +34,9 @@ impl Into<Token> for TokenRow {
             self.id,
             self.token_string,
             self.user_id,
-            self.expired_in
+            self.expired_in,
+            self.token_type,
+            self.blacklisted,
         )
     }
 }
@@ -31,27 +44,90 @@ impl Into<Token> for TokenRow {
 #[derive(Debug, Default)]
 pub struct TokenPGStore;
 
-impl TokenPGStore{
+impl TokenPGStore {
     pub async fn get_by_userid(
         &self,
         connection: &Pool<Postgres>,
         user_id: Uuid,
     ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let rows = sqlx::query_as!(TokenRow, r#"SELECT * FROM tokens WHERE user_id = $1"#, user_id)
+        let rows = sqlx::query_as!(TokenRow, r#"SELECT id, token_string, user_id, expired_in, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens WHERE user_id = $1"#, user_id)
                 .fetch_optional(connection)
                 .await
                 .map_err(StoreError::SqlxError)?;
-        
+
         let token_datas = rows
-        .iter()
-        .map(|row| serde_json::to_value(row.clone()).map_err(StoreError::JsonError))
-        .collect::<Result<Vec<serde_json::Value>, StoreError>>()?;
+            .iter()
+            .map(|row| serde_json::to_value(row.clone()).map_err(StoreError::JsonError))
+            .collect::<Result<Vec<serde_json::Value>, StoreError>>()?;
         Ok(token_datas)
     }
 }
 
 
 impl StoreTrait for TokenPGStore {
+    fn bind_values<'a>(&self,
+        custom_query: Query<'a,Postgres, PgArguments>,
+        json_value: &'a serde_json::Value,
+    ) -> Result<Query<'a,Postgres, PgArguments>, StoreError> {
+        // Loop through the JSON object by key
+        let mut custom_query = custom_query;
+
+        if let serde_json::Value::Object(map) = json_value {
+            for (key, value) in map {
+                println!("Key: {}, Value: {}", key, value);
+                match key.as_str() {
+                    "id"|"user_id" => {
+                        let muid:Uuid = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("uuid obtained is: {:?}", muid);
+                        custom_query = custom_query.bind(muid);
+                    },
+                    "token_type" =>{
+                        let token_type:TokenType = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("token_type obtained is: {:?}", token_type);
+                        custom_query = custom_query.bind(token_type);
+                    }
+                    "created_at"|"updated_at"|"expired_in" => {
+                        let time:NaiveDateTime = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("time obtained is: {:?}", time);
+                        custom_query = custom_query.bind(time);
+                    },
+                    "blacklisted" => {
+                        let blacklisted:bool = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("blacklisted obtained is: {:?}", blacklisted);
+                        custom_query = custom_query.bind(blacklisted);
+                    },
+                    _ => {
+                        // Handle other keys here
+                        let text:String = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
+                        println!("text obtained is: {:?}", text);
+                        custom_query = custom_query.bind(text);
+                    }
+                }
+            }
+        }
+
+        Ok(custom_query)
+    }
+    fn row_to_json(&self,row: &PgRow) -> Result<serde_json::Value, sqlx::Error> {
+        let mut json_obj = serde_json::Map::new();
+        println!("trying to convert to json");
+        for column in row.columns() {
+            let column_name = column.name();
+            println!("column type is: {:?}",column.type_info().name());
+            let column_value: serde_json::Value = match column.type_info().name() {
+                // Handle different types as needed
+                "UUID" => serde_json::json!(row.try_get::<uuid::Uuid, _>(column_name)?),
+                "token_type" => serde_json::json!(row.try_get::<TokenType, _>(column_name)?),
+                "BOOL" => serde_json::json!(row.try_get::<bool, _>(column_name)?),
+                "TIMESTAMP" => serde_json::json!(row.try_get::<NaiveDateTime, _>(column_name)?),
+                _ => serde_json::json!(row.get::<String, _>(column_name)), 
+            };
+    
+            json_obj.insert(column_name.to_owned(), column_value);
+        }
+    
+        Ok(serde_json::Value::Object(json_obj))
+    }
     async fn insert(
         &self,
         connection: &Pool<Postgres>,
@@ -60,18 +136,23 @@ impl StoreTrait for TokenPGStore {
         let token_obj: Token = serde_json::from_value(item).map_err(StoreError::JsonError)?;
 
         let token = token_obj.get_token().to_string();
+        println!("token to insert is: {}",token);
         let user_id = token_obj.get_user_id();
         let expiry = token_obj.get_expired_time();
+        let token_type = token_obj.get_type();
+        let blacklisted = token_obj.get_blacklisted();
         // TODO
         // Store Hash instead of clear password, will be done after implementation of crypto library
         sqlx::query!(
             // language=PostgreSQL
             r#"
-                    insert into "tokens"(token_string,user_id,expired_in)
-                    values ($1, $2, $3)"#,
+                    insert into "tokens"(token_string,user_id,expired_in,token_type,blacklisted)
+                    values ($1, $2, $3, $4, $5)"#,
             token,
             user_id,
-            expiry
+            expiry,
+            token_type as TokenType,
+            blacklisted
         )
         .execute(connection)
         .await
@@ -84,7 +165,7 @@ impl StoreTrait for TokenPGStore {
         connection: &Pool<Postgres>,
         id: Uuid,
     ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let rows = sqlx::query_as!(TokenRow, r#"SELECT * FROM tokens WHERE id = $1"#, id)
+        let rows = sqlx::query_as!(TokenRow, r#"SELECT id, token_string, user_id, expired_in, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens WHERE id = $1"#, id)
             .fetch_all(connection)
             .await
             .map_err(StoreError::SqlxError)?;
@@ -119,10 +200,12 @@ impl StoreTrait for TokenPGStore {
         sqlx::query!(
             // language=PostgreSQL
             r#"
-                update tokens set token_string = $1, user_id = $2, expired_in = $3, updated_at = $4 where id=$5"#,
+                update tokens set token_string = $1, user_id = $2, expired_in = $3, token_type = $4, blacklisted = $5, updated_at = $6 where id=$7"#,
             token_data.get_token(),
             token_data.get_user_id(),
             token_data.get_expired_time(),
+            token_data.get_type() as TokenType,
+            token_data.get_blacklisted(),
             naive_now,
             id
         )
@@ -142,7 +225,7 @@ impl StoreTrait for TokenPGStore {
         let mut keys = Vec::new();
         let mut conditions = Vec::new();
         // Check if the parsed value is an object
-        if let serde_json::Value::Object(map) = json_slug {
+        if let serde_json::Value::Object(map) = json_slug.clone() {
             // Iterate over the key-value pairs in the object
 
             for (key, value) in map {
@@ -157,30 +240,20 @@ impl StoreTrait for TokenPGStore {
         }
         custom_query.push_str(&conditions.join(" AND "));
         println!("final query is: {custom_query}");
-        let mut custom_query = sqlx::query_as::<_, TokenRow>(&custom_query);
-        let mut index:usize = 0;
-        for value in values {
-            match keys[index].as_str() {
-                "user_id" => {
-                    let muid = Uuid::from_str(&value).map_err(StoreError::UUIDError)?;
-                    println!("uuid obtained is: {:?}",muid);
-                    custom_query = custom_query.bind(muid);
-                },
-                _ =>{
-                    custom_query = custom_query.bind(value.clone());
-                }
-            }
-            println!("value to bind is: {value}");
-            index+=1;
-        }
+        let mut custom_query = sqlx::query(&custom_query);
+        custom_query = self.bind_values(custom_query, &json_slug)?;
+        // for value in values{
+        //     custom_query = custom_query.bind(value);
+        // }
         //print!("final query is: {:?}",custom_query);
         let rows = custom_query
             .fetch_all(connection)
             .await
             .map_err(StoreError::SqlxError)?;
+        println!("should have fetched");
         let user_datas = rows
             .iter()
-            .map(|row| serde_json::to_value(row.clone()).map_err(StoreError::JsonError))
+            .map(|row| self.row_to_json(row).map_err(StoreError::SqlxError))
             .collect::<Result<Vec<serde_json::Value>, StoreError>>()?;
         Ok(user_datas)
     }
@@ -206,7 +279,7 @@ impl StoreTrait for TokenPGStore {
     ) -> Result<Vec<serde_json::Value>, StoreError> {
         let rows = sqlx::query_as!(
             TokenRow,
-             r#"SELECT * FROM tokens order by id asc limit $1 offset $2"#,
+             r#"SELECT id, token_string, user_id, expired_in, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens order by id asc limit $1 offset $2"#,
              limit,offset)
             .fetch_all(connection)
             .await
@@ -217,6 +290,41 @@ impl StoreTrait for TokenPGStore {
             .collect::<Result<Vec<serde_json::Value>, StoreError>>()?;
         Ok(user_datas)
     }
+    async fn patch(
+        &self,
+        connection: &Pool<Postgres>,
+        id: Uuid,
+        patch: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let mut custom_query: String = String::from(r#"update tokens set "#);
+        let mut conditions = Vec::new();
+        let mut max_variable = 0;
+        // Check if the parsed value is an object
+        if let serde_json::Value::Object(map) = patch.clone() {
+            // Iterate over the key-value pairs in the object
+
+            for (key, value) in map {
+                println!("Key: {}, Value: {}", key, value);
+                conditions.push(format!("{} = ${}", key, conditions.len() + 1));
+                max_variable = conditions.len() + 1;
+            }
+        } else {
+            log::debug!("The JSON data is not an object");
+            return Err(StoreError::NotFound);
+        }
+        custom_query.push_str(&conditions.join(" , "));
+        custom_query.push_str(format!(" WHERE id = ${}", max_variable).as_str());
+        println!("final query is: {custom_query}");
+        let mut custom_query = sqlx::query(&custom_query);
+        custom_query = self.bind_values(custom_query, &patch)?;
+        custom_query = custom_query.bind(id);
+        println!("id to patch {}", id.to_string());
+        let affected_rows = custom_query
+            .execute(connection)
+            .await
+            .map_err(StoreError::SqlxError)?;
+
+        println!("Updated {} row(s)", affected_rows.rows_affected());
+        Ok(())
+    }
 }
-
-

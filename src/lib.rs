@@ -1,4 +1,4 @@
-mod stores;
+pub mod stores;
 use crate::stores::{store::Store,user_store::UserPGStore,store::StoreError,user_store::UserRow};
 use user_lib::user::user::{User,UserRoles};
 //use token_lib::token::token::Token;
@@ -14,7 +14,7 @@ mod tests {
     use chrono::{Utc,NaiveDateTime};
     use uuid::Uuid;
     use std::env;
-    use token_lib::token::token::Token;
+    use token_lib::token::token::{Token,TokenType};
     use super::*;
 
     async fn get_connection(db_url:&str)-> Result<Pool<Postgres>, Box<dyn std::error::Error>>
@@ -35,13 +35,17 @@ mod tests {
         };
         Ok(db)
     }
-
-    fn get_sample_user()->User{
+    fn get_random_string(length: usize)->String{
         let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let mString = generate(10, charset);
-        println!("Generated username is: {}",mString);
-        User::new(mString,String::from("rillo"),String::from("useruser@gmail.com"),UserRoles::Normal)
+        generate(length, charset)
     }
+    fn get_sample_user()->User{
+        let mString = get_random_string(10);
+        println!("Generated username is: {}",mString);
+        let email = format!("{}@gmail.com",mString);
+        User::new(mString,String::from("rillo"),email,UserRoles::Normal)
+    }
+
     #[tokio::test]
     async fn user_pg_test() {
 
@@ -113,6 +117,23 @@ mod tests {
         assert_eq!(new_user.get_name(),returned_data.get_name());
         assert_eq!(new_user.get_role(),returned_data.get_role());
 
+        let user_data = user_store.get(&db_connection,returned_data.get_id()).await.expect("unable to get user with id");
+        let muser = user_data.first().unwrap().to_owned();
+        let user_row:UserRow = serde_json::from_value(muser).expect("json conversion error");
+        assert_eq!(new_user.get_name(),user_row.username);
+        // patch
+        let json_patch = serde_json::json!({
+            "username": get_random_string(10)
+        });
+        println!("returned data id is: {}",returned_data.get_id());
+        user_store.patch(&db_connection,returned_data.get_id(),json_patch.clone()).await.expect("unable to patch user");
+        let user_data = user_store.get(&db_connection,returned_data.get_id()).await.expect("unable to get user with name");
+
+        let user_data = user_data.first().unwrap();
+
+        let user_row:UserRow = serde_json::from_value(user_data.to_owned()).expect("json conversion error");
+        let json_val = json_patch.get("username").and_then(serde_json::Value::as_str).unwrap();
+        assert_eq!(user_row.username,json_val.to_owned());
         //delete
         user_store.delete(&db_connection,id).await.expect("delete by id failed");
     }
@@ -136,7 +157,8 @@ mod tests {
         let new_token = Token::new(
             user_id,
             token_string,
-            expiry
+            expiry,
+            TokenType::AccessToken
         );
 
         let token_json = serde_json::to_value(&new_token).expect("serialization failed");
@@ -155,7 +177,8 @@ mod tests {
         let second_new_token = Token::new(
             second_user_id,
             second_token_string,
-            expiry
+            expiry,
+            TokenType::RefreshToken
         );
         let second_token_json = serde_json::to_value(&second_new_token).expect("serialization failed");
         // insertion
@@ -202,7 +225,9 @@ mod tests {
             id,
             dummy_token.clone(),
             new_token.get_user_id(),
-            new_token.get_expired_time()
+            new_token.get_expired_time(),
+            new_token.get_type(),
+            new_token.get_blacklisted()
         );
         let third_token_json = serde_json::to_value(&third_new_token).expect("serialization failed");
         println!("thrid token json {:?}",third_token_json);
@@ -227,6 +252,34 @@ mod tests {
         let mtoken_row:TokenRow = serde_json::from_value(mtoken).expect("json conversion error");
         let returned_data:Token=mtoken_row.into();
         assert_eq!(returned_data.get_id(),id);
+
+
+        let json_slug = serde_json::json!({
+            "token_string": returned_token.get_token().to_string()
+        });
+        
+        let token_data = token_store.get_by_slug(&db_connection,json_slug).await.expect("unable to get user with name");
+        println!("slug returned: {:?}",token_data);
+        let mtoken = token_data.last().unwrap().to_owned();
+        let mtoken_row:TokenRow = serde_json::from_value(mtoken).expect("json conversion error");
+        let returned_data:Token=mtoken_row.into();
+        assert_eq!(returned_data.get_id(),id);
+
+        // patch
+        let patch_token = CryptoOp::default().generate_token(&key, token_header_data.clone()).await.expect("token geenration failure");
+        let json_patch = serde_json::json!({
+            "token_string": patch_token 
+        });
+        println!("returned data id is: {}",returned_data.get_id());
+        token_store.patch(&db_connection,returned_data.get_id(),json_patch.clone()).await.expect("unable to patch user");
+        let token_data = token_store.get(&db_connection,returned_data.get_id()).await.expect("unable to get user with name");
+
+        let token_data = token_data.first().unwrap();
+
+        let token_row:TokenRow = serde_json::from_value(token_data.to_owned()).expect("json conversion error");
+        let json_val = json_patch.get("token_string").and_then(serde_json::Value::as_str).unwrap();
+        assert_eq!(token_row.token_string.trim_matches('"').to_string(),json_val.to_owned());
+
 
         //delete
         token_store.delete(&db_connection,id).await.expect("delete by id failed");
