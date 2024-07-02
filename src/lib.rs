@@ -146,18 +146,9 @@ mod tests {
 
         //conection
         let token_store = TokenPGStore::default();
-
-        dotenvy::from_path(".env").expect("dot env error");
-        let key = env::var("HMAC_KEY").expect("env variable error");
-        let user_id = uuid::Uuid::new_v4();
-        let expiry = Utc::now().naive_utc();
-        let user_id_string= user_id.to_string();
-        let token_header_data = serde_json::json!({"user_id":user_id_string.as_str(),"timestamp":expiry.to_string()}).to_string();
-        let token_string = CryptoOp::default().generate_token(&key, token_header_data.clone()).await.expect("token geenration failure");
+        let token_string = get_random_string(10);
         let new_token = Token::new(
-            user_id,
             token_string,
-            expiry,
             TokenType::AccessToken
         );
 
@@ -170,14 +161,10 @@ mod tests {
         let count = token_store.count(&db_connection).await.expect("get count failed");
         println!("initial count is: {count}");
 
-        let second_user_id = uuid::Uuid::new_v4();
-        let expiry = Utc::now().naive_utc();
-        let second_user_id_string= second_user_id.to_string();
-        let second_token_string = CryptoOp::default().generate_token(&key, second_user_id_string).await.expect("token geenration failure");
+
+        let second_token_string = get_random_string(10);
         let second_new_token = Token::new(
-            second_user_id,
-            second_token_string,
-            expiry,
+            second_token_string.clone(),
             TokenType::RefreshToken
         );
         let second_token_json = serde_json::to_value(&second_new_token).expect("serialization failed");
@@ -191,18 +178,31 @@ mod tests {
         assert_eq!(new_count,count+1);
 
 
+        //get by slug
+
+
+        let json_slug = serde_json::json!({
+            "token_string": second_token_string
+        });
+        
+        let token_data = token_store.get_by_slug(&db_connection,json_slug).await.expect("unable to get user with name");
+        println!("slug returned: {:?}",token_data);
+        let mtoken = token_data.last().unwrap().to_owned();
+        let mtoken_row:TokenRow = serde_json::from_value(mtoken).expect("json conversion error");
+        let returned_data:Token=mtoken_row.into();
+        assert_eq!(returned_data.get_token(),second_token_string);
+
 
         //selection
-        let mut m_id:Uuid= Uuid::nil();
-        let token_data = token_store.get_by_userid(&db_connection,second_user_id).await.expect("unable to get user with name");
+        let mut m_id:Uuid= returned_data.get_id();
+        let token_data = token_store.get(&db_connection,m_id).await.expect("unable to get user with name");
         if token_data.len() > 0 {
             let token_row = token_data.first().unwrap();
             let token_row:TokenRow = serde_json::from_value(token_row.to_owned()).expect("Json conversion error");
             let mtoken:Token = token_row.into();
             println!("mtoken: {:?} second_token: {:?}",mtoken,second_new_token);
-            assert_eq!(mtoken.get_expired_time().format("%Y:%m:%d %H:%M").to_string(),second_new_token.get_expired_time().format("%Y:%m:%d %H:%M").to_string());
             assert_eq!(mtoken.get_token(),second_new_token.get_token());
-            assert_eq!(mtoken.get_user_id(),second_new_token.get_user_id());
+            assert_eq!(mtoken.get_type(),returned_data.get_type());
             m_id = mtoken.get_id();
         }
 
@@ -218,14 +218,10 @@ mod tests {
         //update
         let id = m_id;
         println!("new token_id is: {:?}",id);
-        let expiry = Utc::now().naive_utc();
-        let token_header_data = serde_json::json!({"user_id":id.to_string(),"timestamp":expiry.to_string()}).to_string();
-        let dummy_token = CryptoOp::default().generate_token(&key, token_header_data.clone()).await.expect("token geenration failure");
+        let dummy_token = get_random_string(10);
         let third_new_token = Token::new_full(
             id,
             dummy_token.clone(),
-            new_token.get_user_id(),
-            new_token.get_expired_time(),
             new_token.get_type(),
             new_token.get_blacklisted()
         );
@@ -241,32 +237,10 @@ mod tests {
         let returned_token:Token = returned_token.into();
         assert_eq!(dummy_token,returned_token.get_token());
 
-        //get by slug
-        let json_slug = serde_json::json!({
-            "user_id": returned_token.get_user_id().to_string()
-        });
-        
-        let token_data = token_store.get_by_slug(&db_connection,json_slug).await.expect("unable to get user with name");
-        println!("slug returned: {:?}",token_data);
-        let mtoken = token_data.last().unwrap().to_owned();
-        let mtoken_row:TokenRow = serde_json::from_value(mtoken).expect("json conversion error");
-        let returned_data:Token=mtoken_row.into();
-        assert_eq!(returned_data.get_id(),id);
 
-
-        let json_slug = serde_json::json!({
-            "token_string": returned_token.get_token().to_string()
-        });
-        
-        let token_data = token_store.get_by_slug(&db_connection,json_slug).await.expect("unable to get user with name");
-        println!("slug returned: {:?}",token_data);
-        let mtoken = token_data.last().unwrap().to_owned();
-        let mtoken_row:TokenRow = serde_json::from_value(mtoken).expect("json conversion error");
-        let returned_data:Token=mtoken_row.into();
-        assert_eq!(returned_data.get_id(),id);
 
         // patch
-        let patch_token = CryptoOp::default().generate_token(&key, token_header_data.clone()).await.expect("token geenration failure");
+        let patch_token = get_random_string(10);
         let json_patch = serde_json::json!({
             "token_string": patch_token 
         });

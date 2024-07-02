@@ -20,8 +20,6 @@ use sqlx::TypeInfo;
 pub struct TokenRow {
     pub id: Uuid,
     pub token_string: String,
-    pub user_id: Uuid,
-    pub expired_in: NaiveDateTime,
     pub token_type: TokenType,
     pub blacklisted: bool,
     pub created_at: NaiveDateTime,
@@ -33,8 +31,6 @@ impl Into<Token> for TokenRow {
         Token::new_full(
             self.id,
             self.token_string,
-            self.user_id,
-            self.expired_in,
             self.token_type,
             self.blacklisted,
         )
@@ -43,26 +39,20 @@ impl Into<Token> for TokenRow {
 
 #[derive(Debug, Default)]
 pub struct TokenPGStore;
-
-impl TokenPGStore {
-    pub async fn get_by_userid(
-        &self,
-        connection: &Pool<Postgres>,
-        user_id: Uuid,
-    ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let rows = sqlx::query_as!(TokenRow, r#"SELECT id, token_string, user_id, expired_in, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens WHERE user_id = $1"#, user_id)
-                .fetch_optional(connection)
-                .await
-                .map_err(StoreError::SqlxError)?;
-
-        let token_datas = rows
-            .iter()
-            .map(|row| serde_json::to_value(row.clone()).map_err(StoreError::JsonError))
-            .collect::<Result<Vec<serde_json::Value>, StoreError>>()?;
-        Ok(token_datas)
+impl TokenPGStore{
+    pub async fn delete_by_token(&self, connection: &Pool<Postgres>, token_string: String) -> Result<(), StoreError> {
+        sqlx::query!(
+            // language=PostgreSQL
+            r#"
+                    delete from  tokens where token_string=$1"#,
+            token_string
+        )
+        .execute(connection)
+        .await
+        .map_err(StoreError::SqlxError)?;
+        Ok(())
     }
 }
-
 
 impl StoreTrait for TokenPGStore {
     fn bind_values<'a>(&self,
@@ -76,7 +66,7 @@ impl StoreTrait for TokenPGStore {
             for (key, value) in map {
                 println!("Key: {}, Value: {}", key, value);
                 match key.as_str() {
-                    "id"|"user_id" => {
+                    "id" => {
                         let muid:Uuid = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
                         println!("uuid obtained is: {:?}", muid);
                         custom_query = custom_query.bind(muid);
@@ -86,7 +76,7 @@ impl StoreTrait for TokenPGStore {
                         println!("token_type obtained is: {:?}", token_type);
                         custom_query = custom_query.bind(token_type);
                     }
-                    "created_at"|"updated_at"|"expired_in" => {
+                    "created_at"|"updated_at"=> {
                         let time:NaiveDateTime = serde_json::from_value(value.clone()).map_err(StoreError::JsonError)?;
                         println!("time obtained is: {:?}", time);
                         custom_query = custom_query.bind(time);
@@ -137,8 +127,6 @@ impl StoreTrait for TokenPGStore {
 
         let token = token_obj.get_token().to_string();
         println!("token to insert is: {}",token);
-        let user_id = token_obj.get_user_id();
-        let expiry = token_obj.get_expired_time();
         let token_type = token_obj.get_type();
         let blacklisted = token_obj.get_blacklisted();
         // TODO
@@ -146,11 +134,9 @@ impl StoreTrait for TokenPGStore {
         sqlx::query!(
             // language=PostgreSQL
             r#"
-                    insert into "tokens"(token_string,user_id,expired_in,token_type,blacklisted)
-                    values ($1, $2, $3, $4, $5)"#,
+                    insert into "tokens"(token_string,token_type,blacklisted)
+                    values ($1, $2, $3)"#,
             token,
-            user_id,
-            expiry,
             token_type as TokenType,
             blacklisted
         )
@@ -165,7 +151,7 @@ impl StoreTrait for TokenPGStore {
         connection: &Pool<Postgres>,
         id: Uuid,
     ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let rows = sqlx::query_as!(TokenRow, r#"SELECT id, token_string, user_id, expired_in, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens WHERE id = $1"#, id)
+        let rows = sqlx::query_as!(TokenRow, r#"SELECT id, token_string, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens WHERE id = $1"#, id)
             .fetch_all(connection)
             .await
             .map_err(StoreError::SqlxError)?;
@@ -200,10 +186,8 @@ impl StoreTrait for TokenPGStore {
         sqlx::query!(
             // language=PostgreSQL
             r#"
-                update tokens set token_string = $1, user_id = $2, expired_in = $3, token_type = $4, blacklisted = $5, updated_at = $6 where id=$7"#,
+                update tokens set token_string = $1, token_type = $2, blacklisted = $3, updated_at = $4 where id=$5"#,
             token_data.get_token(),
-            token_data.get_user_id(),
-            token_data.get_expired_time(),
             token_data.get_type() as TokenType,
             token_data.get_blacklisted(),
             naive_now,
@@ -279,7 +263,7 @@ impl StoreTrait for TokenPGStore {
     ) -> Result<Vec<serde_json::Value>, StoreError> {
         let rows = sqlx::query_as!(
             TokenRow,
-             r#"SELECT id, token_string, user_id, expired_in, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens order by id asc limit $1 offset $2"#,
+             r#"SELECT id, token_string, created_at, updated_at, token_type AS "token_type!: TokenType", blacklisted FROM tokens order by id asc limit $1 offset $2"#,
              limit,offset)
             .fetch_all(connection)
             .await
